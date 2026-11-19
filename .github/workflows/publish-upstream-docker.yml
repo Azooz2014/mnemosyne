@@ -1,0 +1,106 @@
+name: Publish upstream Mnemosyne Docker image
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '23 */6 * * *'
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: mnemosyne-upstream-docker
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    if: github.repository != 'mnemosyne-oss/mnemosyne' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+
+    steps:
+      - name: Fetch upstream source and tags
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          repository: mnemosyne-oss/mnemosyne
+          ref: main
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Select newest stable core tag
+        id: release
+        shell: bash
+        run: |
+          tag=$(git tag --merged HEAD --sort=-version:refname \
+            | awk '/^v[1-9][0-9]*\.[0-9]+\.[0-9]+$/ && !found {print; found=1}')
+
+          if [[ -z "$tag" ]]; then
+            echo "::error::No stable core release tag found in upstream main history"
+            exit 1
+          fi
+
+          sha=$(git rev-parse --verify "refs/tags/${tag}^{commit}")
+          git checkout --detach "$sha"
+
+          if [[ ! -f Dockerfile ]]; then
+            echo "::error::Upstream tag $tag does not contain a root Dockerfile"
+            exit 1
+          fi
+
+          image="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/mnemosyne-mcp"
+          echo "Selected upstream $tag at $sha"
+          {
+            echo "version=${tag#v}"
+            echo "sha=$sha"
+            echo "image=$image"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Log in to your GHCR namespace
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Check whether this release is already published
+        id: existing
+        shell: bash
+        env:
+          REF: ${{ steps.release.outputs.image }}:${{ steps.release.outputs.version }}
+        run: |
+          if docker buildx imagetools inspect "$REF" >/dev/null; then
+            echo "Published image already exists: $REF"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "Could not resolve $REF; proceeding to build and push"
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130
+        if: steps.existing.outputs.skip == 'false'
+
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f
+        if: steps.existing.outputs.skip == 'false'
+
+      - name: Build and push multi-platform image
+        if: steps.existing.outputs.skip == 'false'
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            ${{ steps.release.outputs.image }}:${{ steps.release.outputs.version }}
+            ${{ steps.release.outputs.image }}:sha-${{ steps.release.outputs.sha }}
+            ${{ steps.release.outputs.image }}:latest
+          build-args: |
+            VERSION=${{ steps.release.outputs.version }}
+            REVISION=${{ steps.release.outputs.sha }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ steps.release.outputs.sha }}
+          provenance: true
+          sbom: true
